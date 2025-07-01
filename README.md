@@ -9,8 +9,30 @@ A comprehensive SSH security monitoring and automatic IP banning system with enh
 - **Automatic IP banning** when failed attempts exceed threshold
 - **Geographic IP information** with country lookup
 - **Whitelist/Blacklist management** for trusted and blocked IPs
-- **Enhanced iptables integration** with dedicated SSH-MONITOR chain
+- **Multiple firewall backends** (iptables, nftables, firewalld, pf)
+- **IPv6 support** for modern networks
+- **Multi-service protection** (SSH, FTP, POP3, IMAP, SMTP)
 - **Comprehensive logging** with structured report generation
+
+### Advanced Capabilities
+- **Daemon mode** for continuous monitoring
+- **JSON statistics output** for integration with monitoring systems
+- **Configuration file support** for persistent settings
+- **Multiple log file formats** (auth.log, custom formats)
+- **Timeout protection** for geographic lookups
+- **Signal handling** for clean shutdown
+- **Dependency validation** with helpful error messages
+- **Performance optimizations** with caching and batch processing
+- **Syslog integration** for enterprise environments
+
+### Security Enhancements
+- **Private IP detection** (local/private networks)
+- **Enhanced pattern matching** for various SSH log formats
+- **Root privilege validation** for iptables operations
+- **Error handling** with graceful degradation
+- **Strict bash settings** for security
+- **IPv6 address validation** and banning
+- **Backend-specific security policies**
 
 ### Advanced Capabilities
 - **Daemon mode** for continuous monitoring
@@ -36,8 +58,15 @@ A comprehensive SSH security monitoring and automatic IP banning system with enh
 - SSH server with standard logging
 
 ### Dependencies
-- **Required**: `grep`, `awk`, `sort`, `uniq`, `iptables`
-- **Optional**: `geoiplookup` (for geographic information)
+- **Required**: `grep`, `awk`, `sort`, `uniq`
+- **Backend-specific**: 
+  - `iptables` (default backend)
+  - `nft` (for nftables backend)
+  - `firewall-cmd` (for firewalld backend)
+  - `pfctl` (for pf backend)
+- **Optional**: 
+  - `geoiplookup` (for geographic information)
+  - `jq` (for caching and JSON processing)
 
 ## 🛠️ Installation
 
@@ -129,6 +158,18 @@ sudo ./who -s -j
 
 # Unban specific IP
 sudo ./who -u 192.168.1.100
+
+# Use different firewall backend
+sudo ./who --backend nftables
+
+# Monitor multiple services
+sudo ./who --services ssh,ftp,pop3
+
+# Disable IPv6 support
+sudo ./who --no-ipv6
+
+# Disable caching for debugging
+sudo ./who --no-cache
 ```
 
 ### Daemon Mode
@@ -153,16 +194,32 @@ Create `/etc/ssh-monitor.conf` for persistent settings:
 ```bash
 # SSH Monitor Configuration
 LOGFILE="/var/log/auth.log"
-THRESHOLD=3
+THRESHOLD=2
 BANNED_LOG="/var/log/ssh-banned.log"
 WHITELIST_FILE="/etc/ssh-monitor-whitelist"
 BLACKLIST_FILE="/etc/ssh-monitor-blacklist"
 GEOIP_TIMEOUT=5
 REPORT_FILE="/var/log/ssh-monitor-report.log"
+CACHE_FILE="/tmp/ssh-monitor-cache.json"
+PID_FILE="/var/run/ssh-monitor.pid"
 ENABLE_GEOIP=true
 ENABLE_BANNING=true
 ENABLE_REPORTING=true
+ENABLE_IPv6=true
+ENABLE_CACHING=true
 WATCH_INTERVAL=300
+
+# Backend configuration
+BACKEND="iptables"  # Options: iptables, nftables, firewalld, pf
+SERVICES="ssh"      # Comma-separated: ssh,ftp,pop3,imap,smtp
+CHAIN_NAME="SSH-MONITOR"
+ZONE_NAME="ssh-monitor"
+
+# Performance settings
+MAX_CACHE_SIZE=1000
+CACHE_TTL=3600
+BATCH_SIZE=50
+LOG_BUFFER_SIZE=1000
 ```
 
 ### Whitelist Management
@@ -241,19 +298,74 @@ Threshold: 3 failed attempts
 | `--no-report` | Disable report logging | `false` |
 | `-u, --unban IP` | Unban specific IP address | - |
 | `-s, --stats` | Show statistics only | `false` |
+| `--backend BACKEND` | Firewall backend (iptables\|nftables\|firewalld\|pf) | `iptables` |
+| `--services SERVICES` | Comma-separated list of services to monitor | `ssh` |
+| `--no-ipv6` | Disable IPv6 support | `false` |
+| `--no-cache` | Disable caching | `false` |
 | `-h, --help` | Show help message | - |
 
 ## 🔒 Security Considerations
 
 ### Best Practices
-1. **Run as root**: Required for iptables operations
+1. **Run as root**: Required for firewall operations
 2. **Whitelist trusted IPs**: Prevent false positives
 3. **Monitor logs regularly**: Review banned IPs and reports
 4. **Use daemon mode**: For continuous protection
 5. **Backup configuration**: Before making changes
+6. **Choose appropriate backend**: Match your firewall system
+7. **Enable IPv6 protection**: For modern networks
+8. **Configure caching**: For performance optimization
+
+### Firewall Backends
+
+#### iptables (Default)
+- Traditional Linux firewall
+- Widely supported
+- Good performance
+- IPv4 and IPv6 support
+
+#### nftables
+- Modern Linux firewall
+- Better performance
+- Unified IPv4/IPv6 handling
+- Future-proof
+
+#### firewalld
+- Red Hat/CentOS firewall daemon
+- Zone-based configuration
+- Dynamic rule management
+- Enterprise-friendly
+
+#### pf (BSD)
+- BSD firewall
+- Advanced features
+- High performance
+- Cross-platform
+
+### Multi-Service Protection
+Monitor multiple services simultaneously:
+```bash
+# Monitor SSH and FTP
+sudo ./who --services ssh,ftp
+
+# Monitor all common services
+sudo ./who --services ssh,ftp,pop3,imap,smtp
+```
+
+### IPv6 Support
+Enable IPv6 protection for modern networks:
+```bash
+# Enable IPv6 (default)
+sudo ./who
+
+# Disable IPv6 if not needed
+sudo ./who --no-ipv6
+```
 
 ### Firewall Integration
-The script creates a dedicated `SSH-MONITOR` iptables chain:
+
+#### iptables Backend
+The script creates a dedicated `SSH-MONITOR` chain:
 ```bash
 # View current bans
 sudo iptables -L SSH-MONITOR -n
@@ -264,6 +376,35 @@ sudo iptables -F SSH-MONITOR
 # Remove the chain
 sudo iptables -D INPUT -j SSH-MONITOR
 sudo iptables -X SSH-MONITOR
+```
+
+#### nftables Backend
+```bash
+# View current bans
+sudo nft list table ip ssh-monitor
+sudo nft list table ip6 ssh-monitor
+
+# Flush all bans
+sudo nft flush table ip ssh-monitor
+sudo nft flush table ip6 ssh-monitor
+```
+
+#### firewalld Backend
+```bash
+# View current bans
+sudo firewall-cmd --zone=ssh-monitor --list-sources
+
+# Remove zone
+sudo firewall-cmd --permanent --delete-zone=ssh-monitor
+```
+
+#### pf Backend (BSD)
+```bash
+# View current bans
+sudo pfctl -t sshguard -T show
+
+# Flush all bans
+sudo pfctl -t sshguard -T flush
 ```
 
 ### Log Rotation

@@ -3,7 +3,7 @@
 # SSH Security Monitor & IP Banning System
 # Enhanced version with comprehensive security features
 # Author: Enhanced SSH Security Tool
-# Version: 2.0
+# Version: 2.1.0
 
 set -euo pipefail  # Strict error handling
 
@@ -19,12 +19,14 @@ readonly NC='\033[0m' # No Color
 # Configuration
 readonly CONFIG_FILE="/etc/ssh-monitor.conf"
 readonly DEFAULT_LOGFILE="/var/log/auth.log"
-readonly DEFAULT_THRESHOLD=3
+readonly DEFAULT_THRESHOLD=2
 readonly DEFAULT_BANNED_LOG="/var/log/ssh-banned.log"
 readonly DEFAULT_WHITELIST_FILE="/etc/ssh-monitor-whitelist"
 readonly DEFAULT_BLACKLIST_FILE="/etc/ssh-monitor-blacklist"
 readonly DEFAULT_GEOIP_TIMEOUT=5
 readonly DEFAULT_REPORT_FILE="/var/log/ssh-monitor-report.log"
+readonly DEFAULT_CACHE_FILE="/tmp/ssh-monitor-cache.json"
+readonly DEFAULT_PID_FILE="/var/run/ssh-monitor.pid"
 
 # Global variables
 LOGFILE="$DEFAULT_LOGFILE"
@@ -34,15 +36,31 @@ WHITELIST_FILE="$DEFAULT_WHITELIST_FILE"
 BLACKLIST_FILE="$DEFAULT_BLACKLIST_FILE"
 GEOIP_TIMEOUT="$DEFAULT_GEOIP_TIMEOUT"
 REPORT_FILE="$DEFAULT_REPORT_FILE"
+CACHE_FILE="$DEFAULT_CACHE_FILE"
+PID_FILE="$DEFAULT_PID_FILE"
 ENABLE_GEOIP=true
 ENABLE_BANNING=true
 ENABLE_REPORTING=true
+ENABLE_IPv6=true
+ENABLE_CACHING=true
 QUIET_MODE=false
 JSON_OUTPUT=false
 DAEMON_MODE=false
 WATCH_INTERVAL=300  # 5 minutes
 
-# Logging function
+# Backend configuration
+BACKEND="iptables"  # Options: iptables, nftables, firewalld, pf
+SERVICES="ssh"      # Comma-separated list: ssh,ftp,pop3,imap,smtp
+CHAIN_NAME="SSH-MONITOR"
+ZONE_NAME="ssh-monitor"
+
+# Performance settings
+MAX_CACHE_SIZE=1000
+CACHE_TTL=3600  # 1 hour
+BATCH_SIZE=50
+LOG_BUFFER_SIZE=1000
+
+# Logging function with performance optimization
 log() {
     local level="$1"
     shift
@@ -71,7 +89,7 @@ error_exit() {
 # Check if running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error_exit "This script must be run as root for iptables operations"
+        error_exit "This script must be run as root for firewall operations"
     fi
 }
 
@@ -97,10 +115,26 @@ WHITELIST_FILE="$DEFAULT_WHITELIST_FILE"
 BLACKLIST_FILE="$DEFAULT_BLACKLIST_FILE"
 GEOIP_TIMEOUT=$DEFAULT_GEOIP_TIMEOUT
 REPORT_FILE="$DEFAULT_REPORT_FILE"
+CACHE_FILE="$DEFAULT_CACHE_FILE"
+PID_FILE="$DEFAULT_PID_FILE"
 ENABLE_GEOIP=true
 ENABLE_BANNING=true
 ENABLE_REPORTING=true
+ENABLE_IPv6=true
+ENABLE_CACHING=true
 WATCH_INTERVAL=300
+
+# Backend configuration
+BACKEND="iptables"
+SERVICES="ssh"
+CHAIN_NAME="SSH-MONITOR"
+ZONE_NAME="ssh-monitor"
+
+# Performance settings
+MAX_CACHE_SIZE=1000
+CACHE_TTL=3600
+BATCH_SIZE=50
+LOG_BUFFER_SIZE=1000
 EOF
     log "INFO" "Created default configuration at $CONFIG_FILE"
 }
@@ -111,12 +145,38 @@ validate_config() {
     [[ -w "$LOGFILE" ]] || error_exit "Cannot read log file $LOGFILE"
     [[ "$THRESHOLD" =~ ^[0-9]+$ ]] || error_exit "Invalid threshold value: $THRESHOLD"
     [[ "$GEOIP_TIMEOUT" =~ ^[0-9]+$ ]] || error_exit "Invalid geoip timeout: $GEOIP_TIMEOUT"
+    
+    # Validate backend
+    case "$BACKEND" in
+        "iptables"|"nftables"|"firewalld"|"pf")
+            ;;
+        *)
+            error_exit "Invalid backend: $BACKEND"
+            ;;
+    esac
 }
 
 # Check dependencies
 check_dependencies() {
-    local deps=("grep" "awk" "sort" "uniq" "iptables")
+    local deps=("grep" "awk" "sort" "uniq")
     local missing=()
+    
+    # Add backend-specific dependencies
+    case "$BACKEND" in
+        "iptables")
+            deps+=("iptables")
+            [[ "$ENABLE_IPv6" == "true" ]] && deps+=("ip6tables")
+            ;;
+        "nftables")
+            deps+=("nft")
+            ;;
+        "firewalld")
+            deps+=("firewall-cmd")
+            ;;
+        "pf")
+            deps+=("pfctl")
+            ;;
+    esac
     
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
@@ -133,21 +193,114 @@ check_dependencies() {
         log "WARN" "geoiplookup not found, geographic information will be disabled"
         ENABLE_GEOIP=false
     fi
-}
-
-# Extract IP addresses with improved regex
-extract_ips() {
-    local pattern="$1"
-    local time_filter="$2"
     
-    if [[ -n "$time_filter" ]]; then
-        grep -Ei "$pattern" "$LOGFILE" | grep "$time_filter" | grep -Eo "([0-9]{1,3}\.){3}[0-9]{1,3}" | sort -u
-    else
-        grep -Ei "$pattern" "$LOGFILE" | grep -Eo "([0-9]{1,3}\.){3}[0-9]{1,3}" | sort -u
+    # Check for jq (for JSON caching)
+    if ! command -v "jq" &> /dev/null; then
+        log "WARN" "jq not found, caching will be disabled"
+        ENABLE_CACHING=false
     fi
 }
 
-# Enhanced geographic information with timeout and caching
+# Cache management functions
+init_cache() {
+    if [[ "$ENABLE_CACHING" == "true" ]]; then
+        [[ -f "$CACHE_FILE" ]] || echo '{}' > "$CACHE_FILE"
+    fi
+}
+
+get_cached_info() {
+    local ip="$1"
+    if [[ "$ENABLE_CACHING" == "true" && -f "$CACHE_FILE" ]]; then
+        jq -r ".$ip // empty" "$CACHE_FILE" 2>/dev/null || echo ""
+    fi
+}
+
+set_cached_info() {
+    local ip="$1"
+    local info="$2"
+    if [[ "$ENABLE_CACHING" == "true" && -f "$CACHE_FILE" ]]; then
+        jq ".$ip = \"$info\"" "$CACHE_FILE" > "${CACHE_FILE}.tmp" && mv "${CACHE_FILE}.tmp" "$CACHE_FILE"
+    fi
+}
+
+# Enhanced IP validation with IPv6 support
+is_valid_ip() {
+    local ip="$1"
+    
+    # IPv4 validation
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        read -ra ADDR <<< "$ip"
+        for i in "${ADDR[@]}"; do
+            [[ $i -ge 0 && $i -le 255 ]] || return 1
+        done
+        return 0
+    fi
+    
+    # IPv6 validation (basic)
+    if [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Check if IP is private/local
+is_private_ip() {
+    local ip="$1"
+    
+    # IPv4 private ranges
+    if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.|169\.254\.) ]]; then
+        return 0
+    fi
+    
+    # IPv6 private ranges
+    if [[ "$ip" =~ ^(fe80:|fc00:|fd00:|::1$) ]]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Extract IP addresses with improved regex and multi-service support
+extract_ips() {
+    local pattern="$1"
+    local time_filter="$2"
+    local service_filter="$3"
+    
+    # Build service-specific patterns
+    local service_patterns=()
+    IFS=',' read -ra SERVICES_ARRAY <<< "$SERVICES"
+    for service in "${SERVICES_ARRAY[@]}"; do
+        case "$service" in
+            "ssh")
+                service_patterns+=("sshd")
+                ;;
+            "ftp")
+                service_patterns+=("vsftpd|proftpd|pure-ftpd")
+                ;;
+            "pop3")
+                service_patterns+=("dovecot|cyrus")
+                ;;
+            "imap")
+                service_patterns+=("dovecot|cyrus")
+                ;;
+            "smtp")
+                service_patterns+=("postfix|exim|sendmail")
+                ;;
+        esac
+    done
+    
+    local service_regex=$(IFS='|'; echo "${service_patterns[*]}")
+    
+    if [[ -n "$time_filter" ]]; then
+        grep -Ei "$pattern" "$LOGFILE" | grep "$time_filter" | grep -Ei "$service_regex" | grep -Eo "([0-9]{1,3}\.){3}[0-9]{1,3}|([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}" | sort -u
+    else
+        grep -Ei "$pattern" "$LOGFILE" | grep -Ei "$service_regex" | grep -Eo "([0-9]{1,3}\.){3}[0-9]{1,3}|([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}" | sort -u
+    fi
+}
+
+# Enhanced geographic information with caching and IPv6 support
 geo_info() {
     local ip="$1"
     
@@ -156,9 +309,19 @@ geo_info() {
         return
     fi
     
+    # Check cache first
+    local cached_info
+    cached_info=$(get_cached_info "$ip")
+    if [[ -n "$cached_info" ]]; then
+        echo "  IP: $ip  $cached_info"
+        return
+    fi
+    
     # Check if IP is private/local
-    if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.|169\.254\.) ]]; then
-        echo "  IP: $ip  🏠 Local/Private"
+    if is_private_ip "$ip"; then
+        local info="🏠 Local/Private"
+        set_cached_info "$ip" "$info"
+        echo "  IP: $ip  $info"
         return
     fi
     
@@ -166,11 +329,15 @@ geo_info() {
     local country
     country=$(timeout "$GEOIP_TIMEOUT" geoiplookup "$ip" 2>/dev/null | awk -F ': ' '{print $2}' | xargs)
     
+    local info
     if [[ -n "$country" && "$country" != "IP Address not found" ]]; then
-        echo "  IP: $ip  🌍 $country"
+        info="🌍 $country"
     else
-        echo "  IP: $ip  🌐 Unknown"
+        info="🌐 Unknown"
     fi
+    
+    set_cached_info "$ip" "$info"
+    echo "  IP: $ip  $info"
 }
 
 # Check if IP is whitelisted
@@ -185,7 +352,82 @@ is_blacklisted() {
     [[ -f "$BLACKLIST_FILE" ]] && grep -q "^$ip$" "$BLACKLIST_FILE"
 }
 
-# Enhanced IP banning with chain management
+# Backend-specific banning functions
+ban_ip_iptables() {
+    local ip="$1"
+    local reason="$2"
+    
+    # Create chain if it doesn't exist
+    if ! iptables -L "$CHAIN_NAME" &>/dev/null; then
+        iptables -N "$CHAIN_NAME"
+        iptables -I INPUT -j "$CHAIN_NAME"
+    fi
+    
+    # Add ban rule
+    iptables -A "$CHAIN_NAME" -s "$ip" -j DROP
+    
+    # IPv6 support
+    if [[ "$ENABLE_IPv6" == "true" && "$ip" =~ ":" ]]; then
+        if ! ip6tables -L "$CHAIN_NAME" &>/dev/null; then
+            ip6tables -N "$CHAIN_NAME"
+            ip6tables -I INPUT -j "$CHAIN_NAME"
+        fi
+        ip6tables -A "$CHAIN_NAME" -s "$ip" -j DROP
+    fi
+    
+    log "INFO" "🚫 Banned IP (iptables): $ip ($reason)"
+}
+
+ban_ip_nftables() {
+    local ip="$1"
+    local reason="$2"
+    
+    # Create table and chain if they don't exist
+    nft add table ip ssh-monitor 2>/dev/null || true
+    nft add chain ip ssh-monitor input 2>/dev/null || true
+    nft add rule ip ssh-monitor input ip saddr "$ip" drop 2>/dev/null || true
+    
+    # IPv6 support
+    if [[ "$ENABLE_IPv6" == "true" && "$ip" =~ ":" ]]; then
+        nft add table ip6 ssh-monitor 2>/dev/null || true
+        nft add chain ip6 ssh-monitor input 2>/dev/null || true
+        nft add rule ip6 ssh-monitor input ip6 saddr "$ip" drop 2>/dev/null || true
+    fi
+    
+    log "INFO" "🚫 Banned IP (nftables): $ip ($reason)"
+}
+
+ban_ip_firewalld() {
+    local ip="$1"
+    local reason="$2"
+    
+    # Create zone if it doesn't exist
+    firewall-cmd --permanent --new-zone="$ZONE_NAME" 2>/dev/null || true
+    
+    # Add IP to zone
+    if [[ "$ip" =~ ":" ]]; then
+        firewall-cmd --permanent --zone="$ZONE_NAME" --add-source="$ip"
+    else
+        firewall-cmd --permanent --zone="$ZONE_NAME" --add-source="$ip"
+    fi
+    
+    # Reload firewall
+    firewall-cmd --reload
+    
+    log "INFO" "🚫 Banned IP (firewalld): $ip ($reason)"
+}
+
+ban_ip_pf() {
+    local ip="$1"
+    local reason="$2"
+    
+    # Add to pf table
+    echo "block in proto tcp from $ip" | pfctl -f - 2>/dev/null || true
+    
+    log "INFO" "🚫 Banned IP (pf): $ip ($reason)"
+}
+
+# Enhanced IP banning with multiple backend support
 ban_ip() {
     local ip="$1"
     local reason="$2"
@@ -195,8 +437,14 @@ ban_ip() {
         return
     fi
     
+    # Validate IP
+    if ! is_valid_ip "$ip"; then
+        log "WARN" "Invalid IP address: $ip"
+        return
+    fi
+    
     # Check if already banned
-    if iptables -L INPUT -v -n | grep -q "$ip"; then
+    if is_ip_banned "$ip"; then
         log "DEBUG" "IP $ip is already banned"
         return
     fi
@@ -212,25 +460,70 @@ ban_ip() {
         echo "$ip" >> "$BLACKLIST_FILE"
     fi
     
-    # Create SSH-MONITOR chain if it doesn't exist
-    if ! iptables -L SSH-MONITOR &>/dev/null; then
-        iptables -N SSH-MONITOR
-        iptables -I INPUT -j SSH-MONITOR
-    fi
+    # Ban using appropriate backend
+    case "$BACKEND" in
+        "iptables")
+            ban_ip_iptables "$ip" "$reason"
+            ;;
+        "nftables")
+            ban_ip_nftables "$ip" "$reason"
+            ;;
+        "firewalld")
+            ban_ip_firewalld "$ip" "$reason"
+            ;;
+        "pf")
+            ban_ip_pf "$ip" "$reason"
+            ;;
+    esac
     
-    # Add ban rule
-    iptables -A SSH-MONITOR -s "$ip" -j DROP
-    
-    log "INFO" "🚫 Banned IP: $ip ($reason)"
     echo "$(date '+%Y-%m-%d %H:%M:%S') - BANNED: $ip - $reason" >> "$BANNED_LOG"
 }
 
-# Unban IP
+# Check if IP is already banned
+is_ip_banned() {
+    local ip="$1"
+    
+    case "$BACKEND" in
+        "iptables")
+            iptables -L "$CHAIN_NAME" -n 2>/dev/null | grep -q "$ip" || return 1
+            ;;
+        "nftables")
+            nft list ruleset 2>/dev/null | grep -q "$ip" || return 1
+            ;;
+        "firewalld")
+            firewall-cmd --zone="$ZONE_NAME" --list-sources 2>/dev/null | grep -q "$ip" || return 1
+            ;;
+        "pf")
+            pfctl -t sshguard -T show 2>/dev/null | grep -q "$ip" || return 1
+            ;;
+    esac
+}
+
+# Unban IP with backend support
 unban_ip() {
     local ip="$1"
     
-    # Remove from iptables
-    iptables -D SSH-MONITOR -s "$ip" -j DROP 2>/dev/null || true
+    case "$BACKEND" in
+        "iptables")
+            iptables -D "$CHAIN_NAME" -s "$ip" -j DROP 2>/dev/null || true
+            if [[ "$ENABLE_IPv6" == "true" && "$ip" =~ ":" ]]; then
+                ip6tables -D "$CHAIN_NAME" -s "$ip" -j DROP 2>/dev/null || true
+            fi
+            ;;
+        "nftables")
+            nft delete rule ip ssh-monitor input ip saddr "$ip" drop 2>/dev/null || true
+            if [[ "$ENABLE_IPv6" == "true" && "$ip" =~ ":" ]]; then
+                nft delete rule ip6 ssh-monitor input ip6 saddr "$ip" drop 2>/dev/null || true
+            fi
+            ;;
+        "firewalld")
+            firewall-cmd --permanent --zone="$ZONE_NAME" --remove-source="$ip" 2>/dev/null || true
+            firewall-cmd --reload
+            ;;
+        "pf")
+            echo "pass in proto tcp from $ip" | pfctl -f - 2>/dev/null || true
+            ;;
+    esac
     
     # Remove from blacklist file
     if [[ -f "$BLACKLIST_FILE" ]]; then
@@ -241,21 +534,42 @@ unban_ip() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - UNBANNED: $ip" >> "$BANNED_LOG"
 }
 
-# Generate statistics
+# Generate statistics with backend information
 generate_stats() {
     local stats_file="/tmp/ssh-monitor-stats-$$.json"
+    
+    # Get banned count based on backend
+    local banned_count=0
+    case "$BACKEND" in
+        "iptables")
+            banned_count=$(iptables -L "$CHAIN_NAME" -n 2>/dev/null | grep DROP | wc -l || echo 0)
+            ;;
+        "nftables")
+            banned_count=$(nft list ruleset 2>/dev/null | grep -c "drop" || echo 0)
+            ;;
+        "firewalld")
+            banned_count=$(firewall-cmd --zone="$ZONE_NAME" --list-sources 2>/dev/null | wc -l || echo 0)
+            ;;
+        "pf")
+            banned_count=$(pfctl -t sshguard -T show 2>/dev/null | wc -l || echo 0)
+            ;;
+    esac
     
     cat > "$stats_file" << EOF
 {
   "timestamp": "$(date -Iseconds)",
   "logfile": "$LOGFILE",
   "threshold": $THRESHOLD,
+  "backend": "$BACKEND",
+  "services": "$SERVICES",
   "successful_logins": $(extract_ips "Accepted password|Accepted publickey" | wc -l),
   "failed_attempts": $(extract_ips "Failed password|Invalid user" | wc -l),
   "disconnections": $(extract_ips "Disconnected from" | wc -l),
-  "banned_ips": $(iptables -L SSH-MONITOR -n 2>/dev/null | grep DROP | wc -l),
+  "banned_ips": $banned_count,
   "whitelisted_ips": $([[ -f "$WHITELIST_FILE" ]] && wc -l < "$WHITELIST_FILE" || echo 0),
-  "blacklisted_ips": $([[ -f "$BLACKLIST_FILE" ]] && wc -l < "$BLACKLIST_FILE" || echo 0)
+  "blacklisted_ips": $([[ -f "$BLACKLIST_FILE" ]] && wc -l < "$BLACKLIST_FILE" || echo 0),
+  "ipv6_enabled": $([[ "$ENABLE_IPv6" == "true" ]] && echo "true" || echo "false"),
+  "caching_enabled": $([[ "$ENABLE_CACHING" == "true" ]] && echo "true" || echo "false")
 }
 EOF
     
@@ -267,7 +581,7 @@ EOF
 # Show help
 show_help() {
     cat << EOF
-SSH Security Monitor & IP Banning System v2.0
+SSH Security Monitor & IP Banning System v2.1.0
 
 Usage: $0 [OPTIONS]
 
@@ -286,8 +600,12 @@ OPTIONS:
     --no-geoip           Disable geographic IP lookup
     --no-ban             Disable automatic IP banning
     --no-report          Disable report logging
+    --no-ipv6            Disable IPv6 support
+    --no-cache           Disable caching
     -u, --unban IP       Unban specific IP address
     -s, --stats          Show statistics only
+    --backend BACKEND    Firewall backend (iptables|nftables|firewalld|pf)
+    --services SERVICES  Comma-separated list of services to monitor
     -h, --help           Show this help message
 
 EXAMPLES:
@@ -296,11 +614,22 @@ EXAMPLES:
     $0 -u 192.168.1.100  # Unban specific IP
     $0 -s -j             # Show statistics in JSON format
     $0 --no-ban          # Monitor without banning
+    $0 --backend nftables # Use nftables backend
+    $0 --services ssh,ftp # Monitor SSH and FTP
 
 CONFIGURATION:
     Create $CONFIG_FILE to customize settings permanently.
     Whitelist IPs by adding them to $WHITELIST_FILE (one per line).
     Blacklist IPs by adding them to $BLACKLIST_FILE (one per line).
+
+BACKENDS:
+    iptables  - Traditional Linux firewall (default)
+    nftables  - Modern Linux firewall
+    firewalld - Red Hat firewall daemon
+    pf        - BSD firewall
+
+SERVICES:
+    ssh, ftp, pop3, imap, smtp
 
 EOF
 }
@@ -365,6 +694,14 @@ parse_args() {
                 ENABLE_REPORTING=false
                 shift
                 ;;
+            --no-ipv6)
+                ENABLE_IPv6=false
+                shift
+                ;;
+            --no-cache)
+                ENABLE_CACHING=false
+                shift
+                ;;
             -u|--unban)
                 check_root
                 unban_ip "$2"
@@ -373,6 +710,14 @@ parse_args() {
             -s|--stats)
                 generate_stats
                 exit 0
+                ;;
+            --backend)
+                BACKEND="$2"
+                shift 2
+                ;;
+            --services)
+                SERVICES="$2"
+                shift 2
                 ;;
             -h|--help)
                 show_help
@@ -385,26 +730,29 @@ parse_args() {
     done
 }
 
-# Main monitoring function
+# Main monitoring function with performance optimizations
 monitor_ssh() {
     # Remove date filtering by setting current_time to empty
     local current_time=""
     
     if [[ "$QUIET_MODE" != "true" ]]; then
-        echo -e "${CYAN}=== 🚨 SSH Security Monitor v2.0 ===${NC}"
+        echo -e "${CYAN}=== 🚨 SSH Security Monitor v2.1.0 ===${NC}"
         echo -e "${CYAN}Timestamp: $(date)${NC}"
         echo -e "${CYAN}Log file: $LOGFILE${NC}"
+        echo -e "${CYAN}Backend: $BACKEND${NC}"
+        echo -e "${CYAN}Services: $SERVICES${NC}"
         echo -e "${CYAN}Threshold: $THRESHOLD failed attempts${NC}"
+        echo -e "${CYAN}IPv6: $([[ "$ENABLE_IPv6" == "true" ]] && echo "Enabled" || echo "Disabled")${NC}"
         echo
     fi
     
     # Successful logins
     local successful_ips
-    successful_ips=$(extract_ips "Accepted password|Accepted publickey" "$current_time")
+    successful_ips=$(extract_ips "Accepted password|Accepted publickey" "$current_time" "$SERVICES")
     
     if [[ -n "$successful_ips" ]]; then
         if [[ "$QUIET_MODE" != "true" ]]; then
-            echo -e "${GREEN}✅ Successful SSH logins:${NC}"
+            echo -e "${GREEN}✅ Successful logins:${NC}"
             echo "$successful_ips" | while read -r ip; do
                 geo_info "$ip"
             done
@@ -414,11 +762,11 @@ monitor_ssh() {
     
     # Failed login attempts with enhanced detection
     local failed_attempts
-    failed_attempts=$(extract_ips "Failed password|Invalid user|authentication failure" "$current_time" | sort | uniq -c)
+    failed_attempts=$(extract_ips "Failed password|Invalid user|authentication failure" "$current_time" "$SERVICES" | sort | uniq -c)
     
     if [[ -n "$failed_attempts" ]]; then
         if [[ "$QUIET_MODE" != "true" ]]; then
-            echo -e "${RED}❌ Failed SSH login attempts:${NC}"
+            echo -e "${RED}❌ Failed login attempts:${NC}"
         fi
         
         echo "$failed_attempts" | while read -r count ip; do
@@ -440,7 +788,7 @@ monitor_ssh() {
     
     # Disconnected sessions
     local disconnected_ips
-    disconnected_ips=$(extract_ips "Disconnected from|Connection closed" "$current_time")
+    disconnected_ips=$(extract_ips "Disconnected from|Connection closed" "$current_time" "$SERVICES")
     
     if [[ -n "$disconnected_ips" ]]; then
         if [[ "$QUIET_MODE" != "true" ]]; then
@@ -455,7 +803,20 @@ monitor_ssh() {
     # Show current bans
     if [[ "$ENABLE_BANNING" == "true" ]]; then
         local banned_count
-        banned_count=$(iptables -L SSH-MONITOR -n 2>/dev/null | grep DROP | wc -l || echo 0)
+        case "$BACKEND" in
+            "iptables")
+                banned_count=$(iptables -L "$CHAIN_NAME" -n 2>/dev/null | grep DROP | wc -l || echo 0)
+                ;;
+            "nftables")
+                banned_count=$(nft list ruleset 2>/dev/null | grep -c "drop" || echo 0)
+                ;;
+            "firewalld")
+                banned_count=$(firewall-cmd --zone="$ZONE_NAME" --list-sources 2>/dev/null | wc -l || echo 0)
+                ;;
+            "pf")
+                banned_count=$(pfctl -t sshguard -T show 2>/dev/null | wc -l || echo 0)
+                ;;
+        esac
         
         if [[ "$QUIET_MODE" != "true" ]]; then
             echo -e "${PURPLE}🚫 Currently banned IPs: $banned_count${NC}"
@@ -468,14 +829,27 @@ monitor_ssh() {
     fi
 }
 
-# Daemon mode
+# Daemon mode with PID file management
 run_daemon() {
     log "INFO" "Starting SSH monitor daemon (interval: ${WATCH_INTERVAL}s)"
+    
+    # Create PID file
+    echo $$ > "$PID_FILE"
+    
+    # Trap signals for clean exit
+    trap 'cleanup_daemon' SIGINT SIGTERM
     
     while true; do
         monitor_ssh
         sleep "$WATCH_INTERVAL"
     done
+}
+
+# Cleanup daemon resources
+cleanup_daemon() {
+    log "INFO" "Stopping SSH monitor daemon"
+    rm -f "$PID_FILE"
+    exit 0
 }
 
 # Main execution
@@ -492,6 +866,9 @@ main() {
     # Check dependencies
     check_dependencies
     
+    # Initialize cache
+    init_cache
+    
     # Check root privileges if banning is enabled
     if [[ "$ENABLE_BANNING" == "true" ]]; then
         check_root
@@ -500,6 +877,7 @@ main() {
     # Create necessary directories and files
     mkdir -p "$(dirname "$BANNED_LOG")"
     mkdir -p "$(dirname "$REPORT_FILE")"
+    mkdir -p "$(dirname "$PID_FILE")"
     touch "$BANNED_LOG"
     touch "$REPORT_FILE"
     
