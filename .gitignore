@@ -1,0 +1,32 @@
+# Logs
+*.log
+/var/log/ssh-banned.log
+/var/log/ssh-monitor-report.log
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/ssh-monitor-stats-*.json
+
+# Configuration files (user-specific)
+/etc/ssh-monitor.conf
+/etc/ssh-monitor-whitelist
+/etc/ssh-monitor-blacklist
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test files
+test-auth.log
+test-ssh-monitor.conf 
